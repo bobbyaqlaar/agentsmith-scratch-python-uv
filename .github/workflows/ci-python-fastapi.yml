@@ -1,0 +1,207 @@
+name: "CI: Python/FastAPI Guardrails"
+
+on:
+  pull_request:
+    branches: ["main", "develop"]
+  push:
+    # develop too: cd-staging.yml deploys only after THIS workflow succeeds on
+    # a push to develop, so without it staging never deploys.
+    branches: ["main", "develop"]
+
+concurrency:
+  group: ci-py-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guardrails:
+    name: "Guardrails — Python/FastAPI"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER:     test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB:       test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # A uv project has no requirements.txt: this step used to install
+          # none of its dependencies, and its tests failed at import. The lock
+          # is exported and installed into THIS interpreter, so every later
+          # step (bare `pytest`, `python3 scripts/...`) sees the same packages
+          # `uv sync` would give a developer — the project itself included,
+          # when it is a package. --no-hashes: pip refuses an editable `-e .`
+          # in hash-checking mode.
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f uv.lock ]; then
+            pip install uv
+            uv export --frozen --no-hashes --format requirements-txt -o "$RUNNER_TEMP/uv-requirements.txt"
+            pip install -r "$RUNNER_TEMP/uv-requirements.txt"
+          fi
+          # ruff PINNED, to the framework's own requirements-lint.txt. Unpinned,
+          # a ruff release changed this gate with no commit: AqlaarTeleologyStudio
+          # resolved 0.16.7, whose defaults grade far more rules than 0.15.x.
+          # Bump deliberately, in this line and your own lock together.
+          pip install \
+            pytest pytest-asyncio pytest-cov httpx "ruff==0.15.20" \
+            "arize-phoenix>=4.0" \
+            "openinference-instrumentation-openai>=0.1.4" \
+            "opentelemetry-sdk>=1.20" \
+            "opentelemetry-exporter-otlp-proto-http>=1.20" \
+            "networkx>=3.0" \
+            "tiktoken>=0.5" \
+            "langchain-core>=0.2" \
+            "langchain-openai>=0.1" \
+            "langchain-anthropic>=0.1"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff format)
+        run: ruff format --check .
+
+      - name: "Validate Knowledge Graph (Pillar 2)"
+        run: |
+          python3 scripts/map_codebase.py --quiet
+          python3 - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          committed = Path(".agent-rfc/fixtures/knowledge_graph.json")
+          if not committed.exists():
+              print("⚠️  No committed knowledge_graph.json — skipping staleness check.")
+              sys.exit(0)
+
+          with committed.open() as f:
+              data = json.load(f)
+
+          node_count = len(data.get("nodes", []))
+          edge_count = len(data.get("edges", data.get("links", [])))
+          print(f"✅ Knowledge Graph: {node_count} nodes, {edge_count} edges")
+
+          if node_count == 0:
+              print("⚠️  Knowledge Graph is empty — map_codebase.py may have failed.")
+              sys.exit(1)
+          EOF
+        continue-on-error: true # warn, not block, until adoption is stable
+
+      - name: "RFC gate (Pillar 1)"
+        run: |
+          if [ ! -f ".agenticframework/org-policy.yaml" ]; then
+            echo "ℹ️  Developer mode — RFC gate skipped."
+            exit 0
+          fi
+          RFC_COUNT=$(find .agent-rfc -maxdepth 1 -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${RFC_COUNT:-0}" -eq 0 ]; then
+            echo "❌ Enterprise policy: at least one RFC required under .agent-rfc/ before merging."
+            exit 1
+          fi
+          echo "✅ RFC gate: ${RFC_COUNT} RFC(s) found."
+
+      - name: "IDE config drift check (Pillar 6/7)"
+        run: python3 scripts/generate-ide-config.py --check-only
+        continue-on-error: true # warn only — blocking is a Phase 5 decision
+
+      - name: "Framework health check (Pillar 3/5)"
+        env:
+          AGENT_PHOENIX_ENDPOINT: ${{ secrets.AGENT_PHOENIX_ENDPOINT || '' }}
+          AGENT_OWNER_ID: ${{ secrets.AGENT_OWNER_ID || 'ci@agenticframework' }}
+        run: python3 scripts/verify_system.py || true # non-blocking — inform, not gate
+
+      - name: Run tests
+        env:
+          DATABASE_URL: "postgresql+asyncpg://test:test@localhost:5432/test"
+          ENVIRONMENT:  "testing"
+        # pytest exits 5 ("no tests collected") on a brand-new project
+        # scaffolded by ai-tenant-init before anyone has written a test
+        # yet — that's an expected day-one state, not a CI failure; any
+        # other non-zero exit (an actual test failure, a collection error)
+        # still fails the job. `run:` blocks default to `set -e`, which
+        # would abort on pytest's own non-zero exit before this script
+        # ever reached `code=$?` — `set +e` first is required for that
+        # capture to actually happen.
+        run: |
+          set +e
+          pytest --cov --cov-report=xml -q
+          code=$?
+          set -e
+          if [ "$code" -eq 5 ]; then
+            echo "ℹ️  No tests collected yet — not failing CI for a fresh project."
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ── Judged suites: check your judge's DAILY quota before leaving all three
+  # on every push. They are independent jobs here because most judges can
+  # afford that; a free tier often cannot.
+  #
+  #   golden 12 + fairness 4 + hallucination 6 = 22 judge calls per run
+  #
+  # Google AI Studio's free tier allows 20 requests per day, per project, per
+  # model, so a tenant on it exceeds the day's budget on the FIRST run and
+  # starves every run after. The failure is silent by design: an unreachable
+  # judge is an infrastructure state, so run-evals reports NO VERDICT and exits
+  # 0, and the check goes green having graded nothing.
+  #
+  # Two things make that survivable. run-evals emits a GitHub warning
+  # annotation and a job-summary block whenever a gate was asked to grade and
+  # could not, so an ungraded gate is visible on a green run. And if your quota
+  # cannot cover a full cycle, move the two cheaper suites onto alternating
+  # `schedule:` crons and keep golden on push — see KYC Sentinel's ci.yml for a
+  # worked example. Pacing (EVAL_RPM) does NOT help here: it limits calls per
+  # minute, not per day.
+  eval-scorecard:
+    name: "Eval scorecard"
+    uses: ./.github/workflows/eval-scorecard.yml
+    secrets: inherit
+
+  eval-fairness:
+    name: "Fairness eval (opt-in)"
+    uses: ./.github/workflows/eval-fairness.yml
+    secrets: inherit
+    with:
+      fairness_mode: warn
+
+  eval-hallucination:
+    name: "Hallucination eval (hard-fail)"
+    uses: ./.github/workflows/eval-hallucination.yml
+    secrets: inherit
+
+  eval-ttft-live:
+    name: "TTFT live (opt-in)"
+    uses: ./.github/workflows/eval-ttft-live.yml
+    secrets: inherit
+
+  security-checks:
+    name: "Security harness"
+    uses: ./.github/workflows/eval-security.yml
+    secrets: inherit
+    with:
+      strict: true
