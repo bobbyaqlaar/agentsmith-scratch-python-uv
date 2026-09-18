@@ -4,6 +4,8 @@
 extend = "../pyproject.toml"
 extend-exclude = [
   "__init__.py",
+  "adopt.py",
+  "architectures.py",
   "cli.py",
   "config.py",
   "conversation_memory.py",
