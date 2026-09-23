@@ -8,6 +8,7 @@ extend-exclude = [
   "architectures.py",
   "cli.py",
   "config.py",
+  "conformance.py",
   "conversation_memory.py",
   "dead_letter.py",
   "embeddings.py",
