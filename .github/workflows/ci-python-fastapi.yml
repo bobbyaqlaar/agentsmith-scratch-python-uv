@@ -1,0 +1,165 @@
+name: "CI: Python/FastAPI Guardrails"
+
+on:
+  pull_request:
+    branches: ["main", "develop"]
+  push:
+    # develop too: cd-staging.yml deploys only after THIS workflow succeeds on
+    # a push to develop, so without it staging never deploys.
+    branches: ["main", "develop"]
+
+concurrency:
+  group: ci-py-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guardrails:
+    name: "Guardrails — Python/FastAPI"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER:     test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB:       test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The gate provider, for the graph check below — installed by its own CI
+      # setup step at the release this repository pins. First, before this job
+      # sets up its own toolchain: the provider runs on the interpreter the
+      # action installs, and the steps after keep the environment they set up.
+      - uses: "bobbyaqlaar/AgentSmith/.github/actions/setup-agentsmith@67929c8d73b873f4755933d59fbb03a4217d4913"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # The project's own dependencies: requirements.txt or uv.lock, through the
+      # provider's composite action at the release this repository pins —
+      # referenced, never copied in.
+      - name: Install project dependencies
+        uses: "bobbyaqlaar/AgentSmith/.github/actions/install-python-deps@67929c8d73b873f4755933d59fbb03a4217d4913"
+
+      - name: Install CI tooling
+        run: |
+          # ruff PINNED, to the framework's own requirements-lint.txt. Unpinned,
+          # a ruff release changed this gate with no commit: AqlaarTeleologyStudio
+          # resolved 0.16.7, whose defaults grade far more rules than 0.15.x.
+          # Bump deliberately, in this line and your own lock together.
+          pip install pytest pytest-asyncio pytest-cov httpx "ruff==0.15.20"
+
+      - name: Lint (ruff)
+        # agentsmith:gate
+        run: ruff check .
+
+      - name: Format check (ruff format)
+        # agentsmith:gate
+        run: ruff format --check .
+
+      - name: "Knowledge Graph is current (Pillar 2)"
+        # agentsmith:gate
+        # The committed graph against what the code maps to now, asked of the
+        # declared gate provider (contract/gate/v3, `kg check`). A repository
+        # with no graph yet passes with a warning; a stale one fails — commit
+        # what `agentsmith gate kg build` writes.
+        run: bash .githooks/process-gate kg check
+
+      - name: "RFC gate (Pillar 1)"
+        # agentsmith:gate
+        run: |
+          if [ ! -f ".agenticframework/org-policy.yaml" ]; then
+            echo "ℹ️  Developer mode — RFC gate skipped."
+            exit 0
+          fi
+          RFC_COUNT=$(find .agent-rfc -maxdepth 1 -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${RFC_COUNT:-0}" -eq 0 ]; then
+            echo "❌ Enterprise policy: at least one RFC required under .agent-rfc/ before merging."
+            exit 1
+          fi
+          echo "✅ RFC gate: ${RFC_COUNT} RFC(s) found."
+
+      - name: Run tests
+        # agentsmith:gate
+        env:
+          DATABASE_URL: "postgresql+asyncpg://test:test@localhost:5432/test"
+          ENVIRONMENT:  "testing"
+        # pytest exits 5 ("no tests collected") on a brand-new project
+        # scaffolded by agentsmith tenant init before anyone has written a test
+        # yet — that's an expected day-one state, not a CI failure; any
+        # other non-zero exit (an actual test failure, a collection error)
+        # still fails the job. `run:` blocks default to `set -e`, which
+        # would abort on pytest's own non-zero exit before this script
+        # ever reached `code=$?` — `set +e` first is required for that
+        # capture to actually happen.
+        # `python -m pytest`, not `pytest`: it puts the repository root on the
+        # import path, so tests/ can import the app (an `app/` beside `tests/`)
+        # with no pytest config. Until 3.0.0 the vendored framework tests put
+        # the root there as a side effect, and hid that bare `pytest` could not.
+        run: |
+          set +e
+          python -m pytest --cov --cov-report=xml -q
+          code=$?
+          set -e
+          if [ "$code" -eq 5 ]; then
+            echo "ℹ️  No tests collected yet — not failing CI for a fresh project."
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ── Judged suites: check your judge's DAILY quota before leaving all three
+  # on every push. They are independent jobs here because most judges can
+  # afford that; a free tier often cannot.
+  #
+  #   golden 12 + fairness 4 + hallucination 6 = 22 judge calls per run
+  #
+  # Google AI Studio's free tier allows 20 requests per day, per project, per
+  # model, so a tenant on it exceeds the day's budget on the FIRST run and
+  # starves every run after. An unjudged suite is `no_verdict`, which fails the
+  # step unless providers.json declares it a warning for that suite — then the
+  # step stays green with a warning annotation that it proved nothing.
+  #
+  # If your quota cannot cover a full cycle, move the two cheaper suites onto
+  # alternating `schedule:` crons and keep golden on push — see KYC Sentinel's
+  # ci.yml for a worked example. Pacing (EVAL_RPM) does NOT help here: it
+  # limits calls per minute, not per day.
+  eval-scorecard:
+    name: "Eval scorecard"
+    uses: ./.github/workflows/eval-scorecard.yml
+    secrets: inherit
+
+  eval-fairness:
+    name: "Fairness eval (opt-in)"
+    uses: ./.github/workflows/eval-fairness.yml
+    secrets: inherit
+    with:
+      fairness_mode: warn
+
+  eval-hallucination:
+    name: "Hallucination eval (hard-fail)"
+    uses: ./.github/workflows/eval-hallucination.yml
+    secrets: inherit
+
+  security-checks:
+    name: "Security (declared provider)"
+    uses: ./.github/workflows/eval-security.yml
+    secrets: inherit
